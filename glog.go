@@ -32,43 +32,7 @@
 //
 //	glog.V(2).Infoln("Processed", nItems, "elements")
 //
-// Log output is buffered and written periodically using Flush. Programs
-// should call Flush before exiting to guarantee all log output is written.
-//
-// By default, all log statements write to files in a temporary directory.
-// This package provides several flags that modify this behavior.
-// As a result, flag.Parse must be called before any logging is done.
-//
-//	-logtostderr=false
-//		Logs are written to standard error instead of to files.
-//	-alsologtostderr=false
-//		Logs are written to standard error as well as to files.
-//	-stderrthreshold=ERROR
-//		Log events at or above this severity are logged to standard
-//		error as well as to files.
-//	-log_dir=""
-//		Log files will be written to this directory instead of the
-//		default temporary directory.
-//
-//	Other flags provide aids to debugging.
-//
-//	-log_backtrace_at=""
-//		When set to a file and line number holding a logging statement,
-//		such as
-//			-log_backtrace_at=gopherflakes.go:234
-//		a stack trace will be written to the Info log whenever execution
-//		hits that statement. (Unlike with -vmodule, the ".go" must be
-//		present.)
-//	-v=0
-//		Enable V-leveled logging at the specified level.
-//	-vmodule=""
-//		The syntax of the argument is a comma-separated list of pattern=N,
-//		where pattern is a literal file name (minus the ".go" suffix) or
-//		"glob" pattern and N is a V level. For instance,
-//			-vmodule=gopher*=3
-//		sets the V level to 3 in all Go files whose names begin "gopher".
-//
-package glog
+package lg
 
 import (
 	"bufio"
@@ -86,6 +50,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	ct "github.com/daviddengcn/go-colortext"
 )
 
 // severity identifies the sort of log: info, warning etc. It also implements
@@ -396,8 +362,11 @@ type flushSyncWriter interface {
 }
 
 func init() {
-	flag.BoolVar(&logging.toStderr, "logtostderr", false, "log to standard error instead of files")
-	flag.BoolVar(&logging.alsoToStderr, "alsologtostderr", false, "log to standard error as well as files")
+	flag.BoolVar(&logging.toMemory, "logtomemory", false, "log to memory")
+	flag.BoolVar(&logging.toFile, "logtofile", true, "log to files")
+	flag.BoolVar(&logging.toStderr, "logtostderr", false, "log to standard error")
+	flag.BoolVar(&logging.color, "logcolor", false, "use colors in standard error display")
+
 	flag.Var(&logging.verbosity, "v", "log level for V logs")
 	flag.Var(&logging.stderrThreshold, "stderrthreshold", "logs at or above this threshold go to stderr")
 	flag.Var(&logging.vmodule, "vmodule", "comma-separated list of pattern=N settings for file-filtered logging")
@@ -420,8 +389,10 @@ type loggingT struct {
 	// Boolean flags. Not handled atomically because the flag.Value interface
 	// does not let us avoid the =true, and that shorthand is necessary for
 	// compatibility. TODO: does this matter enough to fix? Seems unlikely.
-	toStderr     bool // The -logtostderr flag.
-	alsoToStderr bool // The -alsologtostderr flag.
+	toStderr bool // The -logtostderr flag.
+	color    bool // The -logcolor flag.
+	toMemory bool // the -logtomemory flag
+	toFile   bool // the -logtofile flag
 
 	// Level flag. Handled atomically.
 	stderrThreshold severity // The -stderrthreshold flag.
@@ -453,6 +424,11 @@ type loggingT struct {
 	// safely using atomic.LoadInt32.
 	vmodule   moduleSpec // The state of the -vmodule flag.
 	verbosity Level      // V logging level, the value of the -v flag/
+}
+
+// Verbosity returns the current verbosity level.
+func Verbosity() Level {
+	return logging.verbosity
 }
 
 // buffer holds a byte Buffer for reuse. The zero value is ready for use.
@@ -667,6 +643,19 @@ func (l *loggingT) printWithFileLine(s severity, file string, line int, alsoToSt
 	l.output(s, buf, file, line, alsoToStderr)
 }
 
+func printColor(s severity) {
+	switch s {
+	case infoLog:
+		ct.Foreground(ct.Cyan, false)
+	case warningLog:
+		ct.Foreground(ct.Yellow, false)
+	case errorLog:
+		ct.Foreground(ct.Red, true)
+	case fatalLog:
+		ct.Foreground(ct.Red, false)
+	}
+}
+
 // output writes the data to the log files and releases the buffer.
 func (l *loggingT) output(s severity, buf *buffer, file string, line int, alsoToStderr bool) {
 	l.mu.Lock()
@@ -679,31 +668,59 @@ func (l *loggingT) output(s severity, buf *buffer, file string, line int, alsoTo
 	if !flag.Parsed() {
 		os.Stderr.Write([]byte("ERROR: logging before flag.Parse: "))
 		os.Stderr.Write(data)
-	} else if l.toStderr {
-		os.Stderr.Write(data)
 	} else {
-		if alsoToStderr || l.alsoToStderr || s >= l.stderrThreshold.get() {
-			os.Stderr.Write(data)
+		if l.toMemory {
+			logToMemory(data)
 		}
-		if l.file[s] == nil {
-			if err := l.createFiles(s); err != nil {
-				os.Stderr.Write(data) // Make sure the message appears somewhere.
-				l.exit(err)
+		if alsoToStderr || l.toStderr || s >= l.stderrThreshold.get() {
+			if !l.color {
+				os.Stderr.Write(data)
+			} else {
+				// color printing is allowed to be inefficient.
+				printColor(s)
+				os.Stderr.Write(data[0:14])
+				ct.ResetColor()
+				os.Stderr.Write(data[14:30])
+				ct.Foreground(ct.Blue, true)
+				n, _ := os.Stderr.Write([]byte(file))
+				ct.ResetColor()
+				os.Stderr.WriteString(":")
+				printColor(s)
+				rest := data[30+n+1:]
+				end := bytes.IndexAny(rest, "]")
+				os.Stderr.Write(rest[:end])
+				ct.Foreground(ct.Blue, true)
+				os.Stderr.WriteString("]")
+				ct.ResetColor()
+				if l.traceLocation.isSet() && l.traceLocation.match(file, line) {
+					outputColorStack(rest[end+1:], s)
+				} else {
+					os.Stderr.Write(rest[end+1:])
+				}
 			}
 		}
-		switch s {
-		case fatalLog:
-			l.file[fatalLog].Write(data)
-			fallthrough
-		case errorLog:
-			l.file[errorLog].Write(data)
-			fallthrough
-		case warningLog:
-			l.file[warningLog].Write(data)
-			fallthrough
-		case infoLog:
-			l.file[infoLog].Write(data)
+		if l.toFile {
+			if l.file[s] == nil {
+				if err := l.createFiles(s); err != nil {
+					os.Stderr.Write(data) // Make sure the message appears somewhere.
+					l.exit(err)
+				}
+			}
+			switch s {
+			case fatalLog:
+				l.file[fatalLog].Write(data)
+				fallthrough
+			case errorLog:
+				l.file[errorLog].Write(data)
+				fallthrough
+			case warningLog:
+				l.file[warningLog].Write(data)
+				fallthrough
+			case infoLog:
+				l.file[infoLog].Write(data)
+			}
 		}
+
 	}
 	if s == fatalLog {
 		// If we got here via Exit rather than Fatal, print no stacks.
@@ -717,10 +734,25 @@ func (l *loggingT) output(s severity, buf *buffer, file string, line int, alsoTo
 		// If -logtostderr has been specified, the loop below will do that anyway
 		// as the first stack in the full dump.
 		if !l.toStderr {
-			os.Stderr.Write(stacks(false))
+			trace := stacks(false)
+			if l.color {
+				outputColorStack(trace, s)
+			} else {
+				os.Stderr.Write(trace)
+			}
+
 		}
 		// Write the stack trace for all goroutines to the files.
 		trace := stacks(true)
+
+		if l.toStderr {
+			if l.color {
+				outputColorStack(trace, s)
+			} else {
+				os.Stderr.Write(trace)
+			}
+		}
+
 		logExitFunc = func(error) {} // If we get a write error, we'll still exit below.
 		for log := fatalLog; log >= infoLog; log-- {
 			if f := l.file[log]; f != nil { // Can be nil if -logtostderr is set.
@@ -773,6 +805,72 @@ func stacks(all bool) []byte {
 		n *= 2
 	}
 	return trace
+}
+
+// TODO turn into API for resuability in other projects
+var hlstacksrc struct {
+	sync.Mutex
+	v [][]byte
+}
+
+// SetSrcHighlight prepares colored stack trace highliting if -logtostderr and -logcolor are enabled.
+func SetSrcHighlight(paths... string) {
+	hlstacksrc.Lock()
+	hlstacksrc.v = make([][]byte, len(paths))
+	for k, v := range paths {
+		hlstacksrc.v[k] = []byte(v)
+	}
+	hlstacksrc.Unlock()
+}
+
+// outputColorStack is use when -logcolor is enabled.
+// colored stack printing is allowed to be inefficient because it's a local development feature.
+func outputColorStack(stacks []byte, s severity) {
+	r := bytes.NewReader(stacks)
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		l := scanner.Bytes()
+		if len(l) > 0 && l[0] == "\t"[0] {
+			addroffset := bytes.LastIndex(l, []byte(" "))
+			linumoffset := bytes.LastIndex(l, []byte(":"))
+			if addroffset == -1 || linumoffset == -1 {
+				os.Stderr.Write(l)
+				goto eol
+			}
+			srcpath := l[0:linumoffset]
+			hlstart := 0
+			hlstacksrc.Lock()
+			if hlstacksrc.v != nil {
+				for _, v := range hlstacksrc.v {
+					offs := bytes.Index(srcpath, v)
+					if offs > hlstart {
+						hlstart = offs
+					}
+				}
+			}
+			hlstacksrc.Unlock()
+			if hlstart > 0 {
+				os.Stderr.Write(srcpath[:hlstart])
+				ct.Foreground(ct.Blue, true)
+				os.Stderr.Write(srcpath[hlstart:])
+				ct.ResetColor()
+			} else {
+				os.Stderr.Write(srcpath)
+			}
+			os.Stderr.WriteString(":")
+			printColor(s)
+			os.Stderr.Write(l[linumoffset+1 : addroffset])
+			ct.ResetColor()
+			os.Stderr.Write(l[addroffset:])
+		} else {
+			os.Stderr.Write(l)
+		}
+	eol:
+		os.Stderr.WriteString("\n")
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "reading standard input:", err)
+	}
 }
 
 // logExitFunc provides a simple mechanism to override the default behavior
@@ -879,7 +977,7 @@ const flushInterval = 30 * time.Second
 
 // flushDaemon periodically flushes the log file buffers.
 func (l *loggingT) flushDaemon() {
-	for _ = range time.NewTicker(flushInterval).C {
+	for range time.NewTicker(flushInterval).C {
 		l.lockAndFlushAll()
 	}
 }
@@ -920,6 +1018,19 @@ func CopyStandardLogTo(name string) {
 	//   d.go:23: message
 	stdLog.SetFlags(stdLog.Lshortfile)
 	stdLog.SetOutput(logBridge(sev))
+}
+
+// CopyLoggerTo arranges for messages to be written to any log.Logger, see
+// CopyStandardLogTo for details on behaviour and details
+func CopyLoggerTo(name string, logger *stdLog.Logger) {
+	sev, ok := severityByName(name)
+	if !ok {
+		panic(fmt.Sprintf("log.CopyLoggerTo(%q): unrecognized severity name", name))
+	}
+	// Set a log format that captures the user's file and line:
+	//   d.go:23: message
+	logger.SetFlags(stdLog.Lshortfile)
+	logger.SetOutput(logBridge(sev))
 }
 
 // logBridge provides the Write method that enables CopyStandardLogTo to connect
