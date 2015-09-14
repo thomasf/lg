@@ -32,7 +32,7 @@
 //
 //	glog.V(2).Infoln("Processed", nItems, "elements")
 //
-package lg
+package lg // import "github.com/thomasf/lg"
 
 import (
 	"bufio"
